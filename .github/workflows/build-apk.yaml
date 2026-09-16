@@ -51,7 +51,7 @@ jobs:
         run: npx expo config --type public
 
       - name: Initialize or link Expo project
-        run: npx eas-cli@latest project:init --non-interactive
+        run: npx eas-cli@latest project:init --force --account lorduniblesseds-team --non-interactive
 
       - name: Verify generated EAS project ID
         run: |
@@ -120,5 +120,5 @@ jobs:
       - name: Upload failure logs
         if: failure()
         run: |
-          npx eas-cli@latest build:list --platform android --limit 1 --json || true
+          echo "The EAS build failed. Check the failed EAS build URL in the previous step." >> "$GITHUB_STEP_SUMMARY"
         continue-on-error: true
