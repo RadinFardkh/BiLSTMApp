@@ -1,0 +1,123 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/build-apk.yaml'
+
+permissions:
+  contents: read
+
+env:
+  EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install mobile dependencies
+        run: npm install
+
+      - name: Validate Expo configuration
+        run: npx expo config --type public
+
+      - name: Configure EAS project ID
+        env:
+          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+        run: |
+          if [ -z "$EAS_PROJECT_ID" ]; then
+            echo "Missing EAS_PROJECT_ID GitHub secret. Create an Expo project once with 'npx eas-cli@latest project:init', then add its UUID as EAS_PROJECT_ID." >&2
+            exit 1
+          fi
+          if ! echo "$EAS_PROJECT_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+            echo "EAS_PROJECT_ID is not a valid UUID: $EAS_PROJECT_ID" >&2
+            exit 1
+          fi
+          node -e "
+            const fs = require('fs');
+            const path = 'app.json';
+            const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+            config.expo.extra = {
+              ...(config.expo.extra || {}),
+              eas: { ...(config.expo.extra?.eas || {}), projectId: process.env.EAS_PROJECT_ID },
+            };
+            fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+          "
+          # 'expo config --type public' intentionally omits the 'extra' field, so
+          # validate against 'introspect' output (which includes it) instead.
+          npx expo config --type introspect | grep -q "$EAS_PROJECT_ID"
+
+      - name: Build signed APK with EAS
+        id: eas-build
+        run: |
+          # 'eas build:download' only handles simulator/dev-client builds, so the
+          # regular cloud artifact URL is read from the build's own --json output
+          # (falling back to 'build:view' for the definitive artifact link) and
+          # downloaded with curl instead.
+          BUILD_OUTPUT_JSON=$(npx eas-cli@latest build --platform android --profile preview --non-interactive --wait --json)
+          BUILD_ID=$(echo "$BUILD_OUTPUT_JSON" | jq -r 'if type == "array" then .[0].id else .id end')
+          BUILD_STATUS=$(echo "$BUILD_OUTPUT_JSON" | jq -r 'if type == "array" then .[0].status else .status end')
+
+          if [ -z "$BUILD_ID" ] || [ "$BUILD_ID" = "null" ]; then
+            echo "Could not determine the EAS build ID from the build output." >&2
+            echo "$BUILD_OUTPUT_JSON" >&2
+            exit 1
+          fi
+
+          if [ "$BUILD_STATUS" != "FINISHED" ] && [ "$BUILD_STATUS" != "finished" ]; then
+            echo "EAS build did not finish successfully (status: $BUILD_STATUS)." >&2
+            exit 1
+          fi
+
+          echo "build-id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download APK
+        env:
+          BUILD_ID: ${{ steps.eas-build.outputs.build-id }}
+        run: |
+          BUILD_VIEW_JSON=$(npx eas-cli@latest build:view "$BUILD_ID" --json)
+          BUILD_URL=$(echo "$BUILD_VIEW_JSON" | jq -r '.artifacts.buildUrl // empty')
+
+          if [ -z "$BUILD_URL" ]; then
+            echo "No downloadable artifact URL was found for build $BUILD_ID." >&2
+            echo "$BUILD_VIEW_JSON" >&2
+            exit 1
+          fi
+
+          curl -fsSL -o dastyar-offline.apk "$BUILD_URL"
+          ls -lh dastyar-offline.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dastyar-offline-apk
+          path: mobile/dastyar-offline.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Add build summary
+        run: |
+          echo "## Android APK" >> "$GITHUB_STEP_SUMMARY"
+          echo "The APK was built by EAS and uploaded as the dastyar-offline-apk artifact." >> "$GITHUB_STEP_SUMMARY"
+          echo "Model is bundled locally; no inference server is used." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure logs
+        if: failure()
+        run: |
+          npx eas-cli@latest build:list --platform android --limit 1 --json || true
+        continue-on-error: true
