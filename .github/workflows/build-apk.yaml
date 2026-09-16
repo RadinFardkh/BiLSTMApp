@@ -30,37 +30,38 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install mobile dependencies
-        run: npm install
+      - name: Install mobile dependencies and generate lockfile
+        run: npm install --no-audit --no-fund
 
-      - name: Validate Expo configuration
-        run: npx expo config --type public
-
-      - name: Configure EAS project ID
-        env:
-          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+      - name: Remove stale EAS project ID
         run: |
-          if [ -z "$EAS_PROJECT_ID" ]; then
-            echo "Missing EAS_PROJECT_ID GitHub secret. Create an Expo project once with 'npx eas-cli@latest project:init', then add its UUID as EAS_PROJECT_ID." >&2
-            exit 1
-          fi
-          if ! echo "$EAS_PROJECT_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
-            echo "EAS_PROJECT_ID is not a valid UUID: $EAS_PROJECT_ID" >&2
-            exit 1
-          fi
           node -e "
             const fs = require('fs');
             const path = 'app.json';
             const config = JSON.parse(fs.readFileSync(path, 'utf8'));
-            config.expo.extra = {
-              ...(config.expo.extra || {}),
-              eas: { ...(config.expo.extra?.eas || {}), projectId: process.env.EAS_PROJECT_ID },
-            };
-            fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+            if (config.expo?.extra?.eas?.projectId) {
+              delete config.expo.extra.eas.projectId;
+              if (Object.keys(config.expo.extra.eas).length === 0) delete config.expo.extra.eas;
+              if (Object.keys(config.expo.extra || {}).length === 0) delete config.expo.extra;
+              fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\\n');
+            }
           "
-          # 'expo config --type public' intentionally omits the 'extra' field, so
-          # validate against 'introspect' output (which includes it) instead.
-          npx expo config --type introspect | grep -q "$EAS_PROJECT_ID"
+
+      - name: Validate Expo configuration
+        run: npx expo config --type public
+
+      - name: Initialize or link Expo project
+        run: npx eas-cli@latest project:init --non-interactive
+
+      - name: Verify generated EAS project ID
+        run: |
+          PROJECT_ID=$(npx expo config --type introspect | jq -r '.extra.eas.projectId // empty')
+          if ! echo "$PROJECT_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+            echo "EAS did not generate a valid project ID: $PROJECT_ID" >&2
+            exit 1
+          fi
+          echo "Using EAS project: $PROJECT_ID"
+
 
       - name: Build signed APK with EAS
         id: eas-build
